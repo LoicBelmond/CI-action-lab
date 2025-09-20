@@ -1,0 +1,62 @@
+name: Daily Dependency Audit
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # daily 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/node-setup
+        with:
+          node-version: '20'
+
+      - name: npm audit (moderate+); save report (do not fail)
+        run: |
+          npm audit --audit-level=moderate --json > audit.json || true
+
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit-report
+          path: audit.json
+
+      - name: Create/Update issue if vulnerabilities found
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs')
+            const raw = fs.readFileSync('audit.json','utf8')
+            const data = JSON.parse(raw)
+            const meta = data?.metadata?.vulnerabilities || {}
+            const severities = ['critical','high','moderate','low','info']
+            const total = severities.reduce((t,s)=>t+(+meta[s]||0),0)
+            if (total === 0) { core.info('No vulnerabilities found.'); return }
+            const lines = severities.filter(s => (+meta[s]||0)>0)
+              .map(s => `- **${s}**: ${meta[s]}`)
+            const title = `Security vulnerabilities found by npm audit (${new Date().toISOString().slice(0,10)})`
+            const body = [
+              'Automated daily audit detected vulnerabilities.',
+              '',
+              'Counts by severity:',
+              ...lines,
+              '',
+              'See artifact `npm-audit-report` for full JSON.',
+              '',
+              '> Created by Daily Dependency Audit workflow.'
+            ].join('\n')
+            const { owner, repo } = context.repo
+            const open = await github.rest.issues.listForRepo({ owner, repo, state:'open', labels:'security,audit' })
+            const existing = open.data.find(i => i.title.startsWith('Security vulnerabilities found by npm audit'))
+            if (existing) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body })
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body, labels: ['security','audit'] })
+            }
